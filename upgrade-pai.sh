@@ -7,6 +7,7 @@ set -euo pipefail
 # Usage:
 #   ./upgrade-pai.sh              # Upgrade to latest release
 #   ./upgrade-pai.sh v4.0.3       # Upgrade to specific version
+#   ./upgrade-pai.sh --main       # Upgrade from main branch (bleeding-edge)
 #   ./upgrade-pai.sh --dry-run    # Show what would change
 #   ./upgrade-pai.sh --no-backup  # Skip backup step
 # ─────────────────────────────────────────────────────────────────────
@@ -15,6 +16,7 @@ PAI_DIR="${HOME}/.claude"
 REPO_URL="https://github.com/danielmiessler/Personal_AI_Infrastructure.git"
 DRY_RUN=false
 SKIP_BACKUP=false
+USE_MAIN=false
 TARGET_VERSION=""
 BACKUP_DIR=""
 TEMP_DIR=""
@@ -50,12 +52,14 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --dry-run)    DRY_RUN=true; shift ;;
         --no-backup)  SKIP_BACKUP=true; shift ;;
+        --main)       USE_MAIN=true; shift ;;
         --help|-h)
             echo "Usage: upgrade-pai.sh [OPTIONS] [VERSION]"
             echo ""
             echo "Options:"
             echo "  --dry-run     Show what would change without modifying anything"
             echo "  --no-backup   Skip the backup step (use if you've backed up manually)"
+            echo "  --main        Upgrade from main branch instead of a release tag"
             echo "  --help, -h    Show this help message"
             echo ""
             echo "Arguments:"
@@ -93,7 +97,10 @@ CURRENT_ALGO=$(jq -r '.algorithmVersion // "unknown"' "$PAI_DIR/settings.json")
 info "Current version: PAI v${CURRENT_VERSION} (Algorithm v${CURRENT_ALGO})"
 
 # Resolve target version
-if [[ -z "$TARGET_VERSION" ]]; then
+if $USE_MAIN; then
+    TARGET_VERSION="main"
+    info "Target: main branch (bleeding-edge)"
+elif [[ -z "$TARGET_VERSION" ]]; then
     info "No version specified, fetching latest release tag..."
     if command -v gh &>/dev/null; then
         TARGET_VERSION=$(gh api repos/danielmiessler/Personal_AI_Infrastructure/releases/latest --jq '.tag_name' 2>/dev/null || true)
@@ -108,11 +115,13 @@ if [[ -z "$TARGET_VERSION" ]]; then
 fi
 info "Target version: ${TARGET_VERSION}"
 
-# Strip leading 'v' for comparison
-TARGET_NUM="${TARGET_VERSION#v}"
-if [[ "$CURRENT_VERSION" == "$TARGET_NUM" ]]; then
-    warn "Already at version ${CURRENT_VERSION}. Nothing to do."
-    exit 0
+# Skip version comparison for --main (always upgrades)
+if [[ "$TARGET_VERSION" != "main" ]]; then
+    TARGET_NUM="${TARGET_VERSION#v}"
+    if [[ "$CURRENT_VERSION" == "$TARGET_NUM" ]]; then
+        warn "Already at version ${CURRENT_VERSION}. Nothing to do."
+        exit 0
+    fi
 fi
 
 # Check disk space (need ~75MB)
@@ -179,28 +188,43 @@ header "Phase 3: Fetch Release"
 TEMP_DIR=$(mktemp -d /tmp/pai-upgrade-XXXXXX)
 
 if $DRY_RUN; then
-    info "Would clone $REPO_URL tag $TARGET_VERSION to $TEMP_DIR"
+    info "Would clone $REPO_URL ($TARGET_VERSION) to $TEMP_DIR"
 else
     info "Cloning $TARGET_VERSION (shallow)..."
-    git clone --depth 1 --branch "$TARGET_VERSION" "$REPO_URL" "$TEMP_DIR/repo" 2>&1 | tail -1
+    if [[ "$TARGET_VERSION" == "main" ]]; then
+        git clone --depth 1 "$REPO_URL" "$TEMP_DIR/repo" 2>&1 | tail -1
+    else
+        git clone --depth 1 --branch "$TARGET_VERSION" "$REPO_URL" "$TEMP_DIR/repo" 2>&1 | tail -1
+    fi
 fi
 
-# Find the release directory — try versioned path first, then root .claude/
+# Find the release directory
+# Priority: Releases/<version>/.claude/ → latest Releases/*/.claude/ → root .claude/
 RELEASE_DIR=""
-VERSION_DIR="$TEMP_DIR/repo/Releases/${TARGET_VERSION}/.claude"
-ROOT_CLAUDE="$TEMP_DIR/repo/.claude"
 
 if ! $DRY_RUN; then
-    if [[ -d "$VERSION_DIR" ]]; then
-        RELEASE_DIR="$VERSION_DIR"
-        log "Release found at: Releases/${TARGET_VERSION}/.claude/"
-    elif [[ -d "$ROOT_CLAUDE" ]]; then
-        RELEASE_DIR="$ROOT_CLAUDE"
-        log "Release found at: .claude/ (root)"
-    else
-        err "Could not find release files in cloned repo"
-        err "Checked: Releases/${TARGET_VERSION}/.claude/ and .claude/"
-        exit 1
+    if [[ "$TARGET_VERSION" != "main" ]]; then
+        VERSION_DIR="$TEMP_DIR/repo/Releases/${TARGET_VERSION}/.claude"
+        if [[ -d "$VERSION_DIR" ]]; then
+            RELEASE_DIR="$VERSION_DIR"
+            log "Release found at: Releases/${TARGET_VERSION}/.claude/"
+        fi
+    fi
+
+    # For --main or if versioned dir not found, use latest release dir
+    if [[ -z "$RELEASE_DIR" ]]; then
+        LATEST_RELEASE_DIR=$(find "$TEMP_DIR/repo/Releases" -maxdepth 2 -name ".claude" -type d 2>/dev/null \
+            | sort -V | tail -1)
+        if [[ -n "$LATEST_RELEASE_DIR" ]]; then
+            RELEASE_DIR="$LATEST_RELEASE_DIR"
+            log "Release found at: ${RELEASE_DIR#$TEMP_DIR/repo/}"
+        elif [[ -d "$TEMP_DIR/repo/.claude" ]]; then
+            RELEASE_DIR="$TEMP_DIR/repo/.claude"
+            log "Release found at: .claude/ (root)"
+        else
+            err "Could not find release files in cloned repo"
+            exit 1
+        fi
     fi
 fi
 
@@ -208,7 +232,7 @@ fi
 
 header "Phase 4: Selective Sync"
 
-# Paths that are NEVER overwritten (sacred user data)
+# Paths that are NEVER overwritten (sacred user data + Claude Code native dirs)
 EXCLUDE_PATTERNS=(
     "PAI/USER/"
     "MEMORY/"
@@ -217,6 +241,16 @@ EXCLUDE_PATTERNS=(
     ".credentials.json"
     "mcp-needs-auth-cache.json"
     "CLAUDE.md"
+    "keybindings.json"
+    "sessions/"
+    "History/"
+    "cache/"
+    "telemetry/"
+    "tasks/"
+    "plugins/"
+    "ide/"
+    "file-history/"
+    "shell-snapshots/"
 )
 
 RSYNC_EXCLUDES=()
@@ -273,6 +307,14 @@ else
         # Deep merge: release is base, current overrides, then force version from release
         RELEASE_VERSION=$(jq -r '.version // ""' "$RELEASE_SETTINGS")
         RELEASE_ALGO_VERSION=$(jq -r '.algorithmVersion // ""' "$RELEASE_SETTINGS")
+
+        # For --main, use release version if present, otherwise keep current
+        if [[ -z "$RELEASE_VERSION" ]]; then
+            RELEASE_VERSION="$CURRENT_VERSION"
+        fi
+        if [[ -z "$RELEASE_ALGO_VERSION" ]]; then
+            RELEASE_ALGO_VERSION="$CURRENT_ALGO"
+        fi
 
         jq -s --arg ver "$RELEASE_VERSION" --arg algo "$RELEASE_ALGO_VERSION" \
             '.[0] * .[1] * {version: $ver, algorithmVersion: $algo}' \
@@ -410,8 +452,13 @@ else
         "[[ -f '$PAI_DIR/CLAUDE.md' ]]"
 
     NEW_VERSION=$(jq -r '.version // "unknown"' "$PAI_DIR/settings.json")
-    validate "Version updated to $NEW_VERSION" \
-        "[[ '$NEW_VERSION' == '${TARGET_VERSION#v}' ]]"
+    if [[ "$TARGET_VERSION" == "main" ]]; then
+        validate "Version is $NEW_VERSION (main branch)" \
+            "[[ -n '$NEW_VERSION' ]]"
+    else
+        validate "Version updated to $NEW_VERSION" \
+            "[[ '$NEW_VERSION' == '${TARGET_VERSION#v}' ]]"
+    fi
 
     validate "PAI/Algorithm/LATEST exists" \
         "[[ -f '$PAI_DIR/PAI/Algorithm/LATEST' ]]"
@@ -449,7 +496,11 @@ header "Phase 9: Upgrade Report"
 if $DRY_RUN; then
     echo -e "${BOLD}DRY RUN COMPLETE — no changes were made${NC}"
     echo ""
-    info "Would upgrade: PAI v${CURRENT_VERSION} → ${TARGET_VERSION#v}"
+    if [[ "$TARGET_VERSION" == "main" ]]; then
+        info "Would upgrade: PAI v${CURRENT_VERSION} → main (bleeding-edge)"
+    else
+        info "Would upgrade: PAI v${CURRENT_VERSION} → ${TARGET_VERSION#v}"
+    fi
 else
     echo -e "${BOLD}PAI Upgrade Complete${NC}"
     echo ""
@@ -472,6 +523,14 @@ else
         echo -e "  ${YELLOW}Backup:${NC}     $BACKUP_DIR"
         echo -e "              Rollback: ${BOLD}rm -rf ~/.claude && mv $BACKUP_DIR ~/.claude${NC}"
     fi
+
+    # Clean up .pre-upgrade files from rsync --backup (full backup dir is the real safety net)
+    PRE_UPGRADE_COUNT=$(find "$PAI_DIR" -name "*.pre-upgrade" -type f 2>/dev/null | wc -l)
+    if [[ "$PRE_UPGRADE_COUNT" -gt 0 ]]; then
+        find "$PAI_DIR" -name "*.pre-upgrade" -type f -delete
+        info "Cleaned $PRE_UPGRADE_COUNT .pre-upgrade residual files"
+    fi
+
     echo ""
     log "Run 'source ~/.zshrc && pai' to test the upgrade"
 fi
